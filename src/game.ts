@@ -1,130 +1,239 @@
-// Facet — the game. This is the file the build implements.
-//
-// `src/main.ts`, `src/constants.ts` and the project's configuration are supplied
-// with the project and stay as they are. What is missing is the game: the state
-// it holds, the debug surface that poses and reads that state, and the three
-// functions below.
-//
-// First, declare and export `FacetState`, exactly as `specs/state.md` fixes it,
-// and `FacetDebugApi`, the debug and automation surface
-// `specs/instrumentation.md` specifies. The stub below is written against both
-// names, so this project does not compile until they exist. The type check
-// failing on a freshly seeded workspace is the starting point, not a broken
-// seed.
-//
-// Then implement the three functions. `initialize` runs once, when the engine is
-// initialized, and returns the state and the debug surface together, as the pair
-// `[state, debug]`. `update` and `render` then run once each per frame, `update`
-// first, with the frame's delta time in seconds, then `render`.
-//
-// The state is a value, and every frame is a transition over it. The engine
-// hands `update` the current state as a read-only view
-// (`DeepReadonly<FacetState>`, from `ts-essentials`) and stores whatever
-// `update` returns as the next state; `render` is handed that next state, as the
-// same read-only view, and returns nothing. Nothing ever holds a writable
-// `FacetState`: `update` builds the next state from the current one rather than
-// assigning into it, and a frame that returns `undefined` is refused by the
-// engine. The engine's own
-// documentation, seeded at `engine/`, defines all of this and the scoped APIs
-// each function receives; read it before you start.
-//
-// The engine returns the surface from `engine.debug`, exactly as `initialize`
-// handed it over, which is how the game is driven from code
-// (`specs/instrumentation.md`). Because no one holds a writable state, the
-// surface is written in the shape of `update`: a pose takes the current state
-// and returns the next (`loadBoard(state, rows)`, `requestSwap(state, colA,
-// rowA, colB, rowB)`), a reading takes the state and returns what it read
-// (`snapshot(state)`), and a caller drives them through `engine.apply` and
-// `engine.state`. Where its implementation lives under `src/` is your call; the
-// only fixed point is that `initialize` returns it.
-//
-// The pointer comes from the engine as well, and it is what the whole game is
-// worked with: a gem is taken hold of by pressing on it, offered onto its
-// neighbor by pressing or dragging there, and the move is played by the release.
-// Every screen carries pointer targets besides, so a player with nothing but a
-// touchscreen reaches all of them. The engine hands `update` the pointer's
-// position already in logical stage units, along with its press and release
-// edges and the device that drove it. The engine's input documentation, seeded
-// at `engine/`, defines the API, and `specs/controls.md` states what Facet does
-// with them.
-//
-// The sprites, effects, and sounds are produced, not supplied.
-// `specs/assets.md` states what you produce with the asset tools and commit
-// under `public/assets/`; the images and the cues are loaded through the
-// engine's own asset and audio APIs, which its documentation defines.
-
-import type {
-  Game,
-  InitApi,
-  RenderApi,
-  UpdateApi,
-} from "@clockwyrks/simple-2d";
+import type { Game, UpdateApi } from "@clockwyrks/simple-2d";
 import type { DeepReadonly } from "ts-essentials";
+import type { Art } from "./assets";
+import { loadArt } from "./assets";
+import { debug } from "./debug";
+import * as M from "./model";
+import * as C from "./constants";
+import { render } from "./view";
 
-/**
- * The stage background, a CSS color string. `src/main.ts` hands it to the engine
- * as the color the canvas is cleared to each frame, so the letterbox bars around
- * the stage match the board's surround. This placeholder is replaced by the
- * build with the color its board sits on.
- */
-export const BACKGROUND = "#000";
+export type GemKind =
+  "ruby" | "amber" | "citrine" | "jade" | "beryl" | "sapphire" | "amethyst";
 
-const NOT_IMPLEMENTED = "Facet: src/game.ts is not implemented yet";
+export type Cut = "plain" | "brilliant" | "star" | "prism";
 
-/**
- * The game this build's engine drives.
- *
- * Implement all three functions. Nothing else in the project needs changing for
- * the game to run: `src/main.ts` already binds this object to the engine.
- */
+export type Screen =
+  "title" | "howto" | "playing" | "paused" | "levelclear" | "gameover";
+
+export type Phase = "idle" | "swapping" | "resolving";
+
+export type PointerDevice = "mouse" | "pen" | "touch";
+
+export interface CellRef {
+  readonly col: number;
+  readonly row: number;
+}
+
+export interface GemState {
+  readonly col: number;
+  readonly row: number;
+  readonly kind: GemKind | null;
+  readonly cut: Cut;
+  readonly strain: number;
+  readonly fell: number;
+}
+
+export interface BoardState {
+  readonly cols: number;
+  readonly rows: number;
+  readonly cells: readonly GemState[];
+}
+
+export interface RefusalState {
+  readonly a: CellRef;
+  readonly b: CellRef;
+  readonly timer: number;
+}
+
+export interface PointerState {
+  readonly x: number;
+  readonly y: number;
+  readonly down: boolean;
+  readonly device: PointerDevice;
+}
+
+export interface FacetState {
+  readonly screen: Screen;
+  readonly menuIndex: number;
+
+  readonly board: BoardState;
+  readonly phase: Phase;
+  readonly chainStep: number;
+  readonly swapTimer: number;
+  readonly stepTimer: number;
+
+  readonly score: number;
+  readonly level: number;
+  readonly levelScore: number;
+  readonly lastCleared: number;
+  readonly lastPoints: number;
+  readonly lastWaves: number;
+
+  readonly moveScore: number;
+  readonly bestMove: number;
+  readonly bestChain: number;
+
+  readonly selection: CellRef | null;
+  readonly offer: CellRef | null;
+  readonly refusal: RefusalState | null;
+  readonly armedTarget: string | null;
+
+  readonly pointer: PointerState;
+  readonly simTime: number;
+  readonly muted: boolean;
+  readonly refillKinds: readonly string[];
+
+  /** Presentation records for the active swap and chain. */
+  readonly motion?: {
+    readonly a: CellRef;
+    readonly b: CellRef;
+  };
+  readonly fragments?: readonly {
+    readonly gem: GemState;
+    readonly wave: number;
+  }[];
+  readonly flashes?: readonly CellRef[];
+  readonly openingAt?: number;
+  readonly art?: Art;
+}
+
+export type FacetDebugApi = typeof debug;
+export const BACKGROUND = "#09171e";
+
+/** All transitions, including pointer samples, run here before any drawing. */
+export function update(
+  state: DeepReadonly<FacetState>,
+  api: UpdateApi,
+  dt: number,
+): FacetState {
+  let s: FacetState = { ...state, simTime: state.simTime + dt };
+  const cues = new Set<string>();
+  const actions = Object.fromEntries(
+    C.ACTIONS.map((name) => [name, api.input.pressed(name)]),
+  );
+  if (actions.mute) api.audio.setMuted(!api.audio.muted());
+  s = { ...s, muted: api.audio.muted() };
+  if (actions.pause) s = M.pause(s);
+  if (actions.back) s = M.back(s);
+  if (s.screen !== "playing" && s.screen !== "howto") {
+    if (actions.up) s = { ...s, menuIndex: (s.menuIndex + 1) % 2 };
+    if (actions.down) s = { ...s, menuIndex: (s.menuIndex + 1) % 2 };
+    if (actions.confirm) s = M.confirm(s);
+  }
+  for (const sample of api.input.pointerSamples()) {
+    if (!sample.primary || (sample.button && sample.button !== "primary"))
+      continue;
+    const before = s;
+    s = M.pointer(s, sample.type, sample.x, sample.y, sample.device);
+    if (!M.same(before.selection, s.selection) && s.selection)
+      cues.add(C.CUES.select);
+    if (before.phase !== "swapping" && s.phase === "swapping")
+      cues.add(C.CUES.swap);
+    if (s.refusal && s.refusal !== before.refusal) cues.add(C.CUES.refuse);
+  }
+  const p = api.input.pointer();
+  s = { ...s, pointer: { x: p.x, y: p.y, down: p.down, device: p.device } };
+  if (s.screen === "playing") {
+    if (s.refusal)
+      s = {
+        ...s,
+        refusal:
+          s.refusal.timer + dt >= C.REFUSAL_SECONDS
+            ? null
+            : { ...s.refusal, timer: s.refusal.timer + dt },
+      };
+    let remaining = dt;
+    let ladder = 0;
+    // Spend the whole interval, preserving overshoot at every timed boundary.
+    while (remaining > 1e-10 && s.screen === "playing" && s.phase !== "idle") {
+      const swapping = s.phase === "swapping";
+      const timer = swapping ? s.swapTimer : s.stepTimer;
+      const limit = swapping ? C.SWAP_SECONDS : M.stepHold(s);
+      const spend = Math.min(remaining, Math.max(0, limit - timer));
+      if (
+        !swapping &&
+        timer < M.landAt(s) &&
+        timer + spend >= M.landAt(s) &&
+        M.lastFall(s) > C.LAND_MIN_ROWS
+      )
+        cues.add(C.CUES.land);
+      s = swapping
+        ? { ...s, swapTimer: timer + spend }
+        : { ...s, stepTimer: timer + spend };
+      remaining -= spend;
+      if (timer + spend + 1e-10 < limit) break;
+      const result = M.resolve(s, swapping);
+      if (result) {
+        s = result.state;
+        cues.add(C.CUES.clear);
+        ladder = Math.max(ladder, Math.min(s.chainStep, C.MAX_MULTIPLIER));
+        if (result.flawed) cues.add(C.CUES.flaw);
+        if (result.cut) cues.add(C.CUES.cut);
+      } else {
+        s = M.finish(s);
+        if (s.screen === "levelclear") cues.add(C.CUES.levelUp);
+        if (s.screen === "gameover") cues.add(C.CUES.gameOver);
+      }
+    }
+    if (ladder > 0) api.audio.play(`chain-${ladder}`);
+  }
+  // Keep an opening deal still while a menu is up, despite the global clock.
+  if (s.screen !== "playing" && s.openingAt !== undefined)
+    s = { ...s, openingAt: s.openingAt + dt };
+  for (const cue of cues) api.audio.play(cue);
+  const title = s.screen === "title" || s.screen === "howto";
+  const music = title ? "title-music" : "play-music";
+  const other = title ? "play-music" : "title-music";
+  if (api.audio.looping(other)) api.audio.stop(other);
+  if (!api.audio.looping(music)) api.audio.loop(music);
+  return s;
+}
+
 export const game: Game<FacetState, FacetDebugApi> = {
-  /**
-   * Runs once, before any frame.
-   *
-   * Register every action in ACTIONS against its BINDINGS, load the produced
-   * sprites and particle systems and bind each of the CUES to its produced
-   * file, register the diagnostic sources specs/instrumentation.md lists (each
-   * is handed the state current at the read, so none closes over the state
-   * built here), and build the complete initial state: the title screen over an
-   * idle board, with every field of FacetState set exactly as specs/state.md
-   * states. Return it beside the debug surface.
-   */
-  initialize(_api: InitApi<FacetState>): [FacetState, FacetDebugApi] {
-    throw new Error(NOT_IMPLEMENTED);
+  async initialize(api) {
+    for (const action of C.ACTIONS)
+      api.input.register(action, { keys: [...C.BINDINGS[action]] });
+    for (const key of [
+      "screen",
+      "phase",
+      "score",
+      "level",
+      "levelScore",
+      "chainStep",
+      "lastCleared",
+      "lastPoints",
+      "lastWaves",
+      "bestMove",
+      "bestChain",
+    ] as const)
+      api.diagnostics.register(key, (s) => s[key]);
+    api.diagnostics.register(
+      "board",
+      (s) => `${s.board.cols} × ${s.board.rows}`,
+    );
+    api.diagnostics.register(
+      "level target",
+      (s) => C.LEVEL_TARGET_STEP * s.level,
+    );
+    api.diagnostics.register("multiplier", (s) =>
+      Math.min(s.chainStep, C.MAX_MULTIPLIER),
+    );
+    api.diagnostics.register("lastFall", M.lastFall);
+    api.diagnostics.register("legalSwap", (s) => M.legalSwap(s.board));
+    api.diagnostics.register("selection", (s) =>
+      s.selection ? `${s.selection.col}, ${s.selection.row}` : "-",
+    );
+    api.diagnostics.register("offer", (s) =>
+      s.offer ? `${s.offer.col}, ${s.offer.row}` : "-",
+    );
+    api.diagnostics.register(
+      "pointer",
+      (s) =>
+        `${s.pointer.x.toFixed(0)}, ${s.pointer.y.toFixed(0)} ${s.pointer.device}`,
+    );
+    const art = await loadArt(api);
+    return [{ ...M.initial(), art }, debug];
   },
-
-  /**
-   * Runs once per frame, before `render`: the next state, from the current one.
-   *
-   * `dt` is the real elapsed seconds of this frame, and `simTime` accumulates it
-   * on every update whatever the screen. Read the frame's actions and the
-   * pointer position and edges, drive the menus and the pointer targets, decide
-   * every requested swap by the move rules in specs/rules.md, carry an accepted
-   * swap through SWAP_SECONDS and then a chain forward against each step's own
-   * hold, play cues on their events, and mirror the engine's mute bit into the
-   * returned state's `muted`. The value returned is what `render` draws and what
-   * the next `update` receives; `state` itself is read-only and stays as it was.
-   */
-  update(
-    _state: DeepReadonly<FacetState>,
-    _api: UpdateApi,
-    _dt: number,
-  ): FacetState {
-    throw new Error(NOT_IMPLEMENTED);
-  },
-
-  /**
-   * Runs once per frame, after `update`, with the state `update` returned.
-   *
-   * `api.ctx` arrives cleared and already carrying the logical transform, so
-   * draw in 1280x720 coordinates and never read the canvas element's size. Each
-   * cell draws at the center specs/board.md fixes, with the readouts, the screens
-   * and the pointer targets clear of the board's extent. A swap in motion, a
-   * shattering set and a falling gem are each drawn between cells over the spans
-   * specs/rules.md gives them. The state arrives read-only, so the type is what
-   * guarantees that rendering changes nothing.
-   */
-  render(_state: DeepReadonly<FacetState>, _api: RenderApi): void {
-    throw new Error(NOT_IMPLEMENTED);
-  },
+  update,
+  render,
 };

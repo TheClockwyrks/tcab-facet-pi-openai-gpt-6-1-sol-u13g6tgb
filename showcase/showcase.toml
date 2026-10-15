@@ -1,0 +1,11 @@
+[[media]]
+file = "pressure.json.gz"
+name = "One swap, three chain steps"
+
+[[media]]
+file = "board.png"
+name = "A corner ready to break"
+
+[[media]]
+file = "title.png"
+name = "The lapidary collection"
